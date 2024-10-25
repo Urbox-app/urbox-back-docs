@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: controllers/productsController.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: controllers/productsController.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>const admin = require('firebase-admin');
+
+const db = admin.firestore();
+
+/**
+ * Función para generar un SKU automático basado en el tipo de negocio
+ * @param {string} businessType - Tipo de negocio (e.g., 'fashion', 'restaurant', etc.)
+ * @returns {string} SKU generado
+ */
+const generateSKU = (businessType) => {
+  const timestamp = Date.now();
+  const uniqueCode = Math.floor(Math.random() * 1000);
+  return `${businessType
+    .substring(0, 3)
+    .toUpperCase()}-${timestamp}-${uniqueCode}`; // Ejemplo: FAS-1617198124-123
+};
+
+/**
+ * @typedef {Object} ProductData
+ * @property {string} name - Nombre del producto.
+ * @property {string} code - Código único o SKU del producto.
+ * @property {string} category - Categoría del producto (depende del tipo de negocio).
+ * @property {number} price - Precio del producto.
+ * @property {number} quantity - Cantidad disponible en el inventario.
+ * @property {string} unit - Unidad de medida del producto (Ej. `gramos`, `litros`, etc.).
+ * @property {string} tenantId - ID del negocio al cual pertenece el producto.
+ */
+
+/**
+ * @typedef {Object} TenantData
+ * @property {string} tenantId - ID único del negocio (tenant).
+ */
+
+/**
+ * Crea un nuevo producto en el inventario de un negocio específico.
+ *
+ * @async
+ * @function
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {TenantData} req.body.tenant - Datos del negocio (tenant).
+ * @param {ProductData} req.body.data - Datos del producto a crear.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ *
+ * @example
+ * // Ejemplo de JSON para registrar un producto:
+ * {
+ *   "tenant": { "tenantId": "tenant_123" },
+ *   "data": {
+ *     "name": "Camiseta Básica",
+ *     "code": "SKU12345",
+ *     "category": "fashion",
+ *     "price": 19.99,
+ *     "quantity": 50,
+ *     "unit": "pieza"
+ *   }
+ * }
+ */
+exports.createProduct = async (req, res) => {
+  try {
+    const { tenantId } = req.body.tenant;
+    const productData = req.body.data;
+    const { category, sku, autoSKU, businessType } = productData;
+
+    // Validar campos requeridos
+    if (!category) {
+      return res.status(400).json({
+        message: 'La categoría es requerida.',
+        variant: 'error',
+      });
+    }
+
+    // Generar SKU automático si se selecciona la opción de autoSKU
+    let productSKU = sku;
+    if (autoSKU &amp;&amp; businessType) {
+      productSKU = generateSKU(businessType);
+    }
+
+    // Verificar si el código ya existe
+    const existingProduct = await db
+      .collection(`products_${tenantId}`)
+      .where('sku', '==', productSKU)
+      .get();
+
+    if (!existingProduct.empty) {
+      return res.status(400).json({
+        message: 'El SKU de producto ya existe.',
+        variant: 'error',
+      });
+    }
+
+    // Crear producto con SKU, categoría, y timestamp generado por el servidor
+    await db
+      .collection(`products_${tenantId}`)
+      .doc()
+      .create({
+        ...productData,
+        sku: productSKU,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(), // Timestamp generado en Firestore
+        category: category.toLowerCase(),
+      });
+
+    return res
+      .status(200)
+      .json({ message: 'Producto creado correctamente.', variant: 'success' });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ message: `Error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Obtiene la lista de productos de la base de datos.
+ *
+ * @function
+ * @async
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ */
+exports.getProducts = async (req, res) => {
+  try {
+    const { tenantId, category, page = 1, limit = 10 } = req.query;
+    const offset = (page - 1) * limit;
+
+    let query = db
+      .collection(`products_${tenantId}`)
+      .orderBy('timestamp', 'desc'); // Ordenar por timestamp descendente
+
+    // Filtrar por categoría si se proporciona
+    if (category) {
+      query = query.where('category', '==', category.toLowerCase());
+    }
+
+    // Obtener productos para la paginación
+    const snapshot = await query
+      .limit(parseInt(limit, 10))
+      .offset(offset)
+      .get();
+
+    const products = snapshot.docs.map((doc) => ({
+      ...doc.data(),
+      id: doc.id,
+    }));
+
+    return res.status(200).json({
+      products,
+      total: snapshot.size,
+      currentPage: page,
+      hasMore: snapshot.size === parseInt(limit, 10),
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .send({ message: `error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Elimina un producto de la base de datos.
+ *
+ * @function
+ * @async
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ */
+exports.deleteProduct = async (req, res) => {
+  try {
+    const { tenantId, id } = req.query;
+
+    const doc = db.collection(`products_${tenantId}`).doc(id);
+
+    await doc.delete();
+
+    return res.status(200).json({
+      message: 'Producto eliminado correctamente.',
+      variant: 'success',
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .send({ message: `error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Actualiza la información de un producto en la base de datos.
+ *
+ * @function
+ * @async
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ */
+exports.updateProduct = async (req, res) => {
+  try {
+    const { tenantId, id } = req.query;
+    const { data } = req.body;
+
+    const doc = db.collection(`products_${tenantId}`).doc(id);
+    await doc.update(data);
+
+    return res.status(200).json({
+      message: 'Producto actualizado correctamente.',
+      variant: 'success',
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .send({ message: `error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Namespaces</h3><ul><li><a href="CashRegisterRouter.html">CashRegisterRouter</a></li><li><a href="ClientRouter.html">ClientRouter</a></li><li><a href="ExpenseRouter.html">ExpenseRouter</a></li><li><a href="InvoiceRouter.html">InvoiceRouter</a></li><li><a href="ProductRouter.html">ProductRouter</a></li><li><a href="RegisterRouter.html">RegisterRouter</a></li></ul><h3>Global</h3><ul><li><a href="global.html#addTenant">addTenant</a></li><li><a href="global.html#calReport">calReport</a></li><li><a href="global.html#closeCashRegister">closeCashRegister</a></li><li><a href="global.html#createCategory">createCategory</a></li><li><a href="global.html#createClient">createClient</a></li><li><a href="global.html#createEmployees">createEmployees</a></li><li><a href="global.html#createExpense">createExpense</a></li><li><a href="global.html#createInvoice">createInvoice</a></li><li><a href="global.html#createProduct">createProduct</a></li><li><a href="global.html#createRegister">createRegister</a></li><li><a href="global.html#createReport">createReport</a></li><li><a href="global.html#createUser">createUser</a></li><li><a href="global.html#deleteCategory">deleteCategory</a></li><li><a href="global.html#deleteClient">deleteClient</a></li><li><a href="global.html#deleteEmployee">deleteEmployee</a></li><li><a href="global.html#deleteExpense">deleteExpense</a></li><li><a href="global.html#deleteProduct">deleteProduct</a></li><li><a href="global.html#deleteRegister">deleteRegister</a></li><li><a href="global.html#filterExpenses">filterExpenses</a></li><li><a href="global.html#filterRegisters">filterRegisters</a></li><li><a href="global.html#generateSKU">generateSKU</a></li><li><a href="global.html#getClients">getClients</a></li><li><a href="global.html#getDashboardData">getDashboardData</a></li><li><a href="global.html#getEmployees">getEmployees</a></li><li><a href="global.html#getExpenses">getExpenses</a></li><li><a href="global.html#getOrderToday">getOrderToday</a></li><li><a href="global.html#getProducts">getProducts</a></li><li><a href="global.html#getRegisters">getRegisters</a></li><li><a href="global.html#getTotals">getTotals</a></li><li><a href="global.html#infoNavbar">infoNavbar</a></li><li><a href="global.html#initialize">initialize</a></li><li><a href="global.html#initializeDefaultCategories">initializeDefaultCategories</a></li><li><a href="global.html#openCashRegister">openCashRegister</a></li><li><a href="global.html#updateClient">updateClient</a></li><li><a href="global.html#updateCurrentTenant">updateCurrentTenant</a></li><li><a href="global.html#updateEmployees">updateEmployees</a></li><li><a href="global.html#updateExpense">updateExpense</a></li><li><a href="global.html#updateProduct">updateProduct</a></li><li><a href="global.html#updateRegister">updateRegister</a></li><li><a href="global.html#updateTenant">updateTenant</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 4.0.2</a> on Fri Oct 25 2024 00:53:53 GMT-0500 (Colombia Standard Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

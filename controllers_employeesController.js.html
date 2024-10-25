@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: controllers/employeesController.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: controllers/employeesController.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>const admin = require('firebase-admin');
+const Employees = require('../models/employeesModel');
+const { generatePassword } = require('../utils/generatePassword');
+const { configureFeaturesByRole } = require('../utils/configureFeaturesByRole');
+
+const db = admin.firestore();
+
+/**
+ * Crea un nuevo empleado en la base de datos.
+ *
+ * @function
+ * @async
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ *
+ * @example
+ * // Ejemplo de solicitud
+ * const req = {
+ *   body: {
+ *     tenant: { tenantId: "1234", staff: "staff1", rol: "admin" },
+ *     data: {
+ *       email: "empleado@example.com",
+ *       name: "Juan Pérez",
+ *       phone: "123456789",
+ *       nit: "12345678-9",
+ *     }
+ *   }
+ * };
+ *
+ * const res = {
+ *   status: (code) => ({
+ *     json: (data) => console.log(code, data),
+ *   }),
+ * };
+ *
+ * // Llamada a la función
+ * await createEmployees(req, res);
+ *
+ * // Ejemplo de respuesta
+ * // 200 { message: 'Empleado agregado correctamente.', variant: 'success' }
+ */
+
+exports.createEmployees = async (req, res) => {
+  try {
+    const { data, tenant } = req.body;
+
+    // Validar campos requeridos
+    const requiredFields = ['email', 'name', 'phone', 'nit', 'staff', 'rol'];
+    const missingFields = requiredFields.filter((field) => !data[field]);
+
+    if (missingFields.length > 0) {
+      return res.status(400).json({
+        message: `Los campos obligatorios faltan: ${missingFields.join(', ')}`,
+        variant: 'error',
+      });
+    }
+
+    // Verifica si el usuario ya existe en la base de datos
+    const userSnapshot = await db
+      .collection('users')
+      .where('user.email', '==', data.email)
+      .get();
+    const employeesRef = db.collection(`employees_${tenant.tenantId}`);
+
+    // Verifica si el usuario ya está registrado como empleado
+    if (!userSnapshot.empty) {
+      const userId = userSnapshot.docs[0].id;
+      const employeeSnapshot = await employeesRef
+        .where('userId', '==', userId)
+        .get();
+
+      if (!employeeSnapshot.empty) {
+        return res.status(400).json({
+          message: 'El usuario ya se encuentra registrado como empleado.',
+          variant: 'warning',
+        });
+      }
+    }
+
+    // Prepara la información para la navegación
+    const infoNavbar = configureFeaturesByRole(tenant.rol);
+
+    let userId;
+    if (userSnapshot.empty) {
+      // Crea un nuevo usuario en Firebase Authentication
+      const userRecord = await admin.auth().createUser({
+        email: data.email,
+        emailVerified: false,
+        password: generatePassword(),
+      });
+
+      userId = userRecord.uid;
+
+      // Almacena la asociación en la base de datos
+      await db
+        .collection('users')
+        .doc(userId)
+        .set({
+          user: {
+            email: data.email,
+            name: data.name,
+            staff: tenant.staff,
+            rol: tenant.rol,
+          },
+          tenant: {
+            ...tenant,
+            infoNavbar,
+          },
+        });
+    } else {
+      userId = userSnapshot.docs[0].id;
+      const doc = db.collection('users').doc(userId);
+
+      await doc.update({
+        tenants: admin.firestore.FieldValue.arrayUnion({
+          ...tenant,
+          infoNavbar,
+        }),
+      });
+    }
+
+    // Agrega el nuevo empleado
+    const employeeData = {
+      userId,
+      ...data,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    await employeesRef.add(employeeData);
+
+    return res.status(200).json({
+      message: 'Empleado agregado correctamente.',
+      variant: 'success',
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ message: `Error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Obtiene la lista de empleados de la base de datos.
+ *
+ * @function
+ * @async
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ *
+ * @example
+ * // Ejemplo de solicitud
+ * const req = {
+ *   query: {
+ *     tenantId: "1234"
+ *   }
+ * };
+ *
+ * const res = {
+ *   status: (code) => ({
+ *     json: (data) => console.log(code, data),
+ *   }),
+ * };
+ *
+ * // Llamada a la función
+ * await getEmployees(req, res);
+ *
+ * // Ejemplo de respuesta
+ * // 200 [
+ * //   {
+ * //     userId: "abcd1234",
+ * //     name: "Juan Pérez",
+ * //     nit: "12345678-9",
+ * //     phone: "123456789",
+ * //     staff: "staff1",
+ * //     rol: "admin",
+ * //     email: "empleado@example.com"
+ * //   },
+ * //   ...
+ * // ]
+ */
+exports.getEmployees = async (req, res) => {
+  try {
+    const { tenantId } = req.query;
+
+    const querySnapshot = await db.collection(`employees_${tenantId}`).get();
+    const employeesList = querySnapshot.docs.map(
+      (doc) =>
+        new Employees(
+          doc.data().userId,
+          doc.data().name,
+          doc.data().nit,
+          doc.data().phone,
+          doc.data().staff,
+          doc.data().rol,
+          doc.data().email
+        )
+    );
+
+    return res.status(200).json(employeesList);
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ message: `Error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Elimina un empleado de la base de datos.
+ *
+ * @function
+ * @async
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ *
+ * @example
+ * // Ejemplo de solicitud
+ * const req = {
+ *   query: {
+ *     userId: "abcd1234",
+ *     tenantId: "1234"
+ *   }
+ * };
+ *
+ * const res = {
+ *   status: (code) => ({
+ *     json: (data) => console.log(code, data),
+ *   }),
+ * };
+ *
+ * // Llamada a la función
+ * await deleteEmployee(req, res);
+ *
+ * // Ejemplo de respuesta
+ * // 200 { message: 'Empleado eliminado correctamente.', variant: 'success' }
+ */
+exports.deleteEmployee = async (req, res) => {
+  try {
+    const { userId, tenantId } = req.query;
+
+    // Busca el usuario por su userId
+    const userDoc = await db.collection('users').doc(userId).get();
+
+    if (userDoc.exists) {
+      // Actualiza el array de tenants en el documento del usuario
+      const tenants = userDoc
+        .data()
+        .tenants.filter((currentTenant) => currentTenant.tenantId !== tenantId);
+      await db.collection('users').doc(userId).update({ tenants });
+
+      // Elimina el usuario de la colección específica del inquilino
+      const employeesRef = db.collection(`employees_${tenantId}`);
+      const employeeSnapshot = await employeesRef
+        .where('userId', '==', userId)
+        .get();
+
+      if (!employeeSnapshot.empty) {
+        const employeeId = employeeSnapshot.docs[0].id;
+        await employeesRef.doc(employeeId).delete();
+      }
+
+      return res.status(200).json({
+        message: 'Empleado eliminado correctamente.',
+        variant: 'success',
+      });
+    }
+
+    return res
+      .status(404)
+      .json({ message: 'Empleado no encontrado', variant: 'warning' });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ message: `Error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Actualiza la información de un empleado en la base de datos.
+ *
+ * @function
+ * @async
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ *
+ * @example
+ * // Ejemplo de solicitud
+ * const req = {
+ *   user: { uid: "abcd1234" },
+ *   query: {
+ *     id: "employeeId"
+ *   },
+ *   body: {
+ *     data: {
+ *       name: "Juan Pérez Actualizado",
+ *       phone: "987654321"
+ *     }
+ *   }
+ * };
+ *
+ * const res = {
+ *   status: (code) => ({
+ *     json: (data) => console.log(code, data),
+ *   }),
+ * };
+ *
+ * // Llamada a la función
+ * await updateEmployees(req, res);
+ *
+ * // Ejemplo de respuesta
+ * // 200 { message: 'Empleado actualizado correctamente.', variant: 'success' }
+ */
+exports.updateEmployees = async (req, res) => {
+  try {
+    const { userId } = req.user; // Obtener ID del usuario actual
+    const { id } = req.query; // ID del empleado a actualizar
+
+    // Validar que se pasaron datos para la actualización
+    if (!req.body.data || Object.keys(req.body.data).length === 0) {
+      return res.status(400).json({
+        message: 'No se proporcionaron datos para actualizar.',
+        variant: 'error',
+      });
+    }
+
+    await db.collection(`employees_${userId}`).doc(id).update(req.body.data);
+
+    return res.status(200).json({
+      message: 'Empleado actualizado correctamente.',
+      variant: 'success',
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ message: `Error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Namespaces</h3><ul><li><a href="CashRegisterRouter.html">CashRegisterRouter</a></li><li><a href="ClientRouter.html">ClientRouter</a></li><li><a href="ExpenseRouter.html">ExpenseRouter</a></li><li><a href="InvoiceRouter.html">InvoiceRouter</a></li><li><a href="ProductRouter.html">ProductRouter</a></li><li><a href="RegisterRouter.html">RegisterRouter</a></li></ul><h3>Global</h3><ul><li><a href="global.html#addTenant">addTenant</a></li><li><a href="global.html#calReport">calReport</a></li><li><a href="global.html#closeCashRegister">closeCashRegister</a></li><li><a href="global.html#createCategory">createCategory</a></li><li><a href="global.html#createClient">createClient</a></li><li><a href="global.html#createEmployees">createEmployees</a></li><li><a href="global.html#createExpense">createExpense</a></li><li><a href="global.html#createInvoice">createInvoice</a></li><li><a href="global.html#createProduct">createProduct</a></li><li><a href="global.html#createRegister">createRegister</a></li><li><a href="global.html#createReport">createReport</a></li><li><a href="global.html#createUser">createUser</a></li><li><a href="global.html#deleteCategory">deleteCategory</a></li><li><a href="global.html#deleteClient">deleteClient</a></li><li><a href="global.html#deleteEmployee">deleteEmployee</a></li><li><a href="global.html#deleteExpense">deleteExpense</a></li><li><a href="global.html#deleteProduct">deleteProduct</a></li><li><a href="global.html#deleteRegister">deleteRegister</a></li><li><a href="global.html#filterExpenses">filterExpenses</a></li><li><a href="global.html#filterRegisters">filterRegisters</a></li><li><a href="global.html#generateSKU">generateSKU</a></li><li><a href="global.html#getClients">getClients</a></li><li><a href="global.html#getDashboardData">getDashboardData</a></li><li><a href="global.html#getEmployees">getEmployees</a></li><li><a href="global.html#getExpenses">getExpenses</a></li><li><a href="global.html#getOrderToday">getOrderToday</a></li><li><a href="global.html#getProducts">getProducts</a></li><li><a href="global.html#getRegisters">getRegisters</a></li><li><a href="global.html#getTotals">getTotals</a></li><li><a href="global.html#infoNavbar">infoNavbar</a></li><li><a href="global.html#initialize">initialize</a></li><li><a href="global.html#initializeDefaultCategories">initializeDefaultCategories</a></li><li><a href="global.html#openCashRegister">openCashRegister</a></li><li><a href="global.html#updateClient">updateClient</a></li><li><a href="global.html#updateCurrentTenant">updateCurrentTenant</a></li><li><a href="global.html#updateEmployees">updateEmployees</a></li><li><a href="global.html#updateExpense">updateExpense</a></li><li><a href="global.html#updateProduct">updateProduct</a></li><li><a href="global.html#updateRegister">updateRegister</a></li><li><a href="global.html#updateTenant">updateTenant</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 4.0.2</a> on Fri Oct 25 2024 00:53:53 GMT-0500 (Colombia Standard Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

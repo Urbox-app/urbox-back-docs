@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: controllers/registerController.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: controllers/registerController.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>const moment = require('moment');
+const admin = require('firebase-admin');
+const { v4: uuidv4 } = require('uuid');
+const Order = require('../models/ordersModel');
+const calReport = require('../utils/calReport');
+const calOrders = require('../utils/calOrders');
+
+const db = admin.firestore();
+
+/**
+ * Crea un nuevo registro de pedido o gasto.
+ *
+ * @async
+ * @function createRegister
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} req.user - Información del usuario autenticado.
+ * @param {string} req.user.uid - ID del usuario autenticado.
+ * @param {Object} req.body - Cuerpo de la solicitud con datos del pedido.
+ * @param {Object} req.body.tenant - Datos del inquilino actual.
+ * @param {string} req.body.tenant.tenantId - ID del inquilino.
+ * @param {string} req.body.tenant.cashRegisterId - ID de la caja registradora.
+ * @param {Object} req.body.data - Datos de la orden o gasto.
+ * @param {Array&lt;Object>} req.body.data.items - Array de objetos que representan los ítems en la orden.
+ * @param {Object} req.body.data.bill - Datos de facturación como total, cliente, tipo, pago, etc.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ *
+ * @example
+ * // Ejemplo de solicitud para registrar una venta o gasto
+ * const req = {
+ *   user: { uid: 'user123' },
+ *   body: {
+ *     tenant: {
+ *       tenantId: 'tenant123',
+ *       cashRegisterId: 'register456'
+ *     },
+ *     data: {
+ *       items: [
+ *         { id: 'prod1', stock: 2, price: 100, type: 1 },
+ *         { id: 'prod2', stock: 1, price: 200, type: 1 }
+ *       ],
+ *       bill: {
+ *         total: 400,
+ *         pay: 300,
+ *         type: 'order', // Puede ser 'expenses' o 'order'
+ *         client: 'client789',
+ *         date: '2024-10-20'
+ *       }
+ *     }
+ *   }
+ * };
+ *
+ * const res = {}; // Objeto de respuesta Express
+ *
+ * @example
+ * // Respuesta exitosa:
+ * {
+ *   "message": "Orden registrado correctamente.",
+ *   "variant": "success"
+ * }
+ *
+ * @example
+ * // Error si la caja no está abierta:
+ * {
+ *   "message": "No se encontró una caja abierta para este tenant.",
+ *   "variant": "warning"
+ * }
+ */
+exports.createRegister = async (req, res) => {
+  try {
+    const { uid } = req.user;
+    const { tenantId, cashRegisterId } = req.body.tenant;
+    const orderData = req.body.data;
+
+    const userDoc = db.collection('users').doc(uid);
+    const userSnapshot = await userDoc.get();
+
+    const { items, bill } = orderData;
+
+    // get current tenant
+    const currentTenant = userSnapshot.data();
+
+    const indexToUpdate = currentTenant.tenants.findIndex(
+      (tenant) => tenant.tenantId === tenantId
+    );
+
+    const numBill = currentTenant.tenants[indexToUpdate].numBill || 0;
+    const newNumBill = numBill + 1;
+    const type = bill.type.toLowerCase() === 'expenses' ? 'EG' : 'FAC';
+    const newInvoiceNumber = `${type}${moment().year()}-${String(
+      newNumBill
+    ).padStart(4, '0')}`;
+    currentTenant.tenants[indexToUpdate].numBill = newNumBill;
+
+    // Validación de los campos de la factura
+    if (!items || !bill.total || !bill.date || !bill.pay || !bill.client) {
+      return res.status(400).json({
+        message: 'Datos de facturación incompletos.',
+        variant: 'warning',
+      });
+    }
+
+    // Obtener la caja actual del inquilino
+    const cashRegister = db
+      .collection(`cashRegister_${tenantId}`)
+      .doc(cashRegisterId);
+    const cashRegisterSnapshot = await cashRegister.get();
+
+    const data = cashRegisterSnapshot.data();
+
+    if (!data.status) {
+      return res.status(400).json({
+        message: 'No se encontró una caja abierta para este tenant.',
+        variant: 'warning',
+      });
+    }
+
+    const inventoryRef = db.collection(`products_${tenantId}`);
+
+    // Verificar si es una "Venta Libre"
+    const isFreeSale = items.length === 1 &amp;&amp; items[0].type === 0;
+
+    const typeOrder =
+      bill.type.toLowerCase() === 'expenses' ? 'expenses' : 'orders';
+
+    if (!isFreeSale &amp;&amp; typeOrder === 'orders') {
+      // Validar si la cantidad solicitada está disponible en el inventario
+      const inventoryChecks = await Promise.all(
+        items.map(async (item) => {
+          const inventoryItem = await inventoryRef.doc(item.id).get();
+          const availableStock = inventoryItem.data().stock;
+
+          if (availableStock &lt; item.stock) {
+            return false;
+          }
+
+          return true;
+        })
+      );
+
+      if (inventoryChecks.includes(false)) {
+        return res.status(400).json({
+          message: 'Cantidad solicitada no disponible en el inventario',
+          variant: 'warning',
+        });
+      }
+    }
+
+    const batch = db.batch();
+
+    // Actualizar el número de factura del usuario
+    batch.update(userDoc, currentTenant);
+
+    if (!isFreeSale &amp;&amp; typeOrder === 'orders') {
+      // Actualizar el inventario
+      const inventoryUpdates = items.map(async (item) => {
+        const inventoryItemRef = inventoryRef.doc(item.id);
+        const currentStock = (await inventoryItemRef.get()).data().stock;
+        return inventoryItemRef.update({
+          stock: currentStock - item.stock,
+        });
+      });
+
+      // Esperar todas las actualizaciones del inventario antes de realizar el commit
+      await Promise.all(inventoryUpdates);
+    }
+
+    // Generar la orden con más datos, incluyendo impuestos y estado de pago
+    const newOrder = {
+      ...orderData,
+      id: uuidv4(),
+      bill: {
+        ...bill,
+        num: newInvoiceNumber,
+        date: moment(bill.date).toISOString(),
+        must: bill.total - bill.pay, // Monto pendiente de pago
+        total: bill.total,
+        pay: bill.pay,
+        tax: bill.tax || 0, // Impuesto aplicable
+        status: bill.pay >= bill.total ? 'Paid' : 'Pending', // Estado de la factura
+        client: bill.client || 'Cliente Generico', // Cliente
+      },
+      createdBy: uid, // Usuario que realizó la venta
+      createdAt: moment().toISOString(), // Fecha de creación
+    };
+
+    // Actualizar caja registradora con la nueva orden
+    const updatedCashRegisterData = {
+      ...cashRegisterSnapshot.data(),
+      currentBalance:
+        bill.type.toLowerCase() === 'expenses'
+          ? cashRegisterSnapshot.data().currentBalance - bill.pay
+          : cashRegisterSnapshot.data().currentBalance + bill.pay,
+      orders: [...(cashRegisterSnapshot.data().orders || []), newOrder],
+      lastTransaction: moment().toISOString(), // Fecha de la última transacción
+    };
+
+    batch.update(cashRegister, updatedCashRegisterData);
+
+    // Realizar las operaciones en lote
+    await batch.commit();
+
+    return res
+      .status(200)
+      .json({ message: 'Orden registrada correctamente.', variant: 'success' });
+  } catch (error) {
+    return res
+      .status(500)
+      .send({ message: `error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Obtiene los registros de pedidos.
+ *
+ * @async
+ * @function getRegisters
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} req.query - Objeto de consulta de la solicitud con datos del inquilino y caja.
+ * @param {string} req.query.tenantId - ID del inquilino actual.
+ * @param {string} req.query.cashRegisterId - ID de la caja registradora activa.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ *
+ * @example
+ * // Ejemplo de solicitud para obtener registros:
+ * const req = {
+ *   query: {
+ *     tenantId: 'tenant123',
+ *     cashRegisterId: 'register456'
+ *   }
+ * };
+ *
+ * const res = {}; // Objeto de respuesta Express
+ *
+ * @example
+ * // Respuesta exitosa (lista de órdenes):
+ * [
+ *   {
+ *     "id": "order1",
+ *     "client": "client789",
+ *     "items": [
+ *       { "id": "prod1", "stock": 2, "price": 100 },
+ *       { "id": "prod2", "stock": 1, "price": 200 }
+ *     ],
+ *     "bill": {
+ *       "num": "FAC2024-0001",
+ *       "total": 400,
+ *       "pay": 300,
+ *       "must": 100,
+ *       "date": "2024-10-20"
+ *     }
+ *   },
+ *   {
+ *     "id": "order2",
+ *     "client": "client456",
+ *     "items": [
+ *       { "id": "prod3", "stock": 1, "price": 150 }
+ *     ],
+ *     "bill": {
+ *       "num": "FAC2024-0002",
+ *       "total": 150,
+ *       "pay": 150,
+ *       "must": 0,
+ *       "date": "2024-10-21"
+ *     }
+ *   }
+ * ]
+ */
+exports.getRegisters = async (req, res) => {
+  try {
+    const { tenantId, cashRegisterId } = req.query;
+
+    // Obtener la caja actual del inquilino
+    const cashRegister = db
+      .collection(`cashRegister_${tenantId}`)
+      .doc(cashRegisterId);
+    const cashRegisterSnapshot = await cashRegister.get();
+
+    const docs = cashRegisterSnapshot.data();
+
+    const orders = docs.orders.map(
+      (doc) => new Order(doc.id, doc.client, doc.items, doc.bill)
+    );
+
+    return res.status(200).json(orders);
+  } catch (error) {
+    return res
+      .status(500)
+      .send({ message: `error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Actualiza un registro de pedido.
+ *
+ * @async
+ * @function updateRegister
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} req.query - Objeto de consulta de la solicitud con datos del pedido a actualizar.
+ * @param {string} req.query.id - ID del pedido a actualizar.
+ * @param {string} req.query.tenantId - ID del inquilino actual.
+ * @param {string} req.query.cashRegisterId - ID de la caja registradora.
+ * @param {Object} req.body - Cuerpo de la solicitud con datos actualizados.
+ * @param {Object} req.body.data - Nuevos datos para actualizar el pedido.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ *
+ * @example
+ * // Ejemplo de solicitud para actualizar un pedido:
+ * const req = {
+ *   query: {
+ *     id: 'order1',
+ *     tenantId: 'tenant123',
+ *     cashRegisterId: 'register456'
+ *   },
+ *   body: {
+ *     data: {
+ *       client: 'clientUpdated',
+ *       items: [
+ *         { id: 'prod1', stock: 3, price: 100 }
+ *       ],
+ *       bill: {
+ *         total: 300,
+ *         pay: 200,
+ *         must: 100,
+ *         date: '2024-10-22'
+ *       }
+ *     }
+ *   }
+ * };
+ *
+ * const res = {}; // Objeto de respuesta Express
+ *
+ * @example
+ * // Respuesta exitosa:
+ * {
+ *   "message": "Orden actualizada correctamente.",
+ *   "variant": "success"
+ * }
+ */
+
+exports.updateRegister = async (req, res) => {
+  try {
+    const { id, tenantId, cashRegisterId } = req.query;
+    const updatedOrderData = req.body.data;
+
+    // Obtener la caja actual del inquilino
+    const cashRegisterRef = db.collection(`cashRegister_${tenantId}`);
+    const cashRegisterDoc = cashRegisterRef.doc(cashRegisterId);
+    const cashRegisterSnapshot = await cashRegisterDoc.get();
+
+    if (!cashRegisterSnapshot.exists) {
+      return res.status(400).json({
+        message: 'No se encontró una caja abierta para este inquilino.',
+        variant: 'warning',
+      });
+    }
+
+    const cashRegisterData = cashRegisterSnapshot.data();
+
+    if (!cashRegisterData.status) {
+      return res.status(400).json({
+        message: 'La caja está cerrada. No se pueden actualizar registros.',
+        variant: 'warning',
+      });
+    }
+
+    // Buscar la orden en el array de órdenes por su ID
+    const orderIndex = cashRegisterData.orders.findIndex(
+      (order) => order.id === id
+    );
+
+    if (orderIndex === -1) {
+      return res.status(404).json({
+        message: 'No se encontró la orden con el ID especificado.',
+        variant: 'error',
+      });
+    }
+
+    // Actualizar la orden con los nuevos datos
+    const updatedOrders = [...cashRegisterData.orders];
+    updatedOrders[orderIndex] = {
+      ...updatedOrders[orderIndex],
+      ...updatedOrderData,
+    };
+
+    // Órdenes calculadas.
+    const currentBalance = calOrders(updatedOrders);
+
+    // Actualizar el documento de la caja registradora con el array de órdenes actualizado
+    await cashRegisterDoc.update({
+      currentBalance,
+      orders: updatedOrders,
+    });
+
+    return res.status(200).json({
+      message: 'Orden actualizada correctamente.',
+      variant: 'success',
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .send({ message: `error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Elimina un registro de pedido.
+ *
+ * @async
+ * @function deleteRegister
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} req.query - Objeto de consulta de la solicitud con datos del pedido a eliminar.
+ * @param {string} req.query.id - ID del pedido a eliminar.
+ * @param {string} req.query.tenantId - ID del inquilino actual.
+ * @param {string} req.query.cashRegisterId - ID de la caja registradora.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ *
+ * @example
+ * // Ejemplo de solicitud para eliminar un pedido:
+ * const req = {
+ *   query: {
+ *     id: 'order1',
+ *     tenantId: 'tenant123',
+ *     cashRegisterId: 'register456'
+ *   }
+ * };
+ *
+ * const res = {}; // Objeto de respuesta Express
+ *
+ * @example
+ * // Respuesta exitosa:
+ * {
+ *   "message": "Orden eliminada correctamente.",
+ *   "variant": "success"
+ * }
+ *
+ * @example
+ * // Error si la caja está cerrada:
+ * {
+ *   "message": "La caja está cerrada. No se pueden eliminar registros.",
+ *   "variant": "warning"
+ * }
+ */
+exports.deleteRegister = async (req, res) => {
+  try {
+    const { id, tenantId, cashRegisterId } = req.query;
+
+    const cashRegisterRef = db.collection(`cashRegister_${tenantId}`);
+    const cashRegisterDoc = cashRegisterRef.doc(cashRegisterId);
+    const cashRegisterSnapshot = await cashRegisterDoc.get();
+
+    if (!cashRegisterSnapshot.exists) {
+      return res.status(400).json({
+        message: 'No se encontró una caja abierta para este inquilino.',
+        variant: 'warning',
+      });
+    }
+
+    const cashRegisterData = cashRegisterSnapshot.data();
+
+    if (!cashRegisterData.status) {
+      return res.status(400).json({
+        message: 'La caja está cerrada. No se pueden eliminar registros.',
+        variant: 'warning',
+      });
+    }
+
+    // Filtrar el array de órdenes para excluir la orden con el ID especificado
+    const updatedOrders = cashRegisterData.orders.filter(
+      (order) => order.id !== id
+    );
+
+    // Órdenes calculadas.
+    const currentBalance = calOrders(updatedOrders);
+
+    // Actualizar el documento de la caja registradora con el nuevo array de órdenes
+    await cashRegisterDoc.update({
+      currentBalance,
+      orders: updatedOrders,
+    });
+
+    return res.status(200).json({
+      message: 'Orden eliminada correctamente.',
+      variant: 'success',
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .send({ message: `error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Filtra los registros de pedidos por fecha y tipo.
+ *
+ * @function
+ * @async
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ */
+exports.filterRegisters = async (req, res) => {
+  try {
+    const { tenantId } = req.body.tenant;
+    const { from, to, type } = req.body.data;
+    const query = db.collection(`orders_${tenantId}`);
+
+    // Comenzar a construir la consulta
+    let firestoreQuery = query.select('client', 'items', 'bill'); // Solo selecciona los campos necesarios
+
+    // Ajustar la consulta según el tipo
+    if (type === 'range') {
+      firestoreQuery = firestoreQuery
+        .where(from.camp, '>=', from.data)
+        .where(to.camp, '&lt;=', to.data);
+    } else {
+      firestoreQuery = firestoreQuery.where(from.camp, '==', from.data);
+    }
+
+    const { docs, empty } = await firestoreQuery.get();
+
+    // Si no hay documentos, responder con un arreglo vacío
+    if (empty) {
+      return res.status(200).json([]);
+    }
+
+    // Mapear los documentos a un formato deseado
+    const response = docs.map((doc) => ({
+      id: doc.id,
+      client: doc.data().client,
+      items: doc.data().items,
+      bill: doc.data().bill,
+    }));
+
+    return res.status(200).json(response);
+  } catch (error) {
+    return res
+      .status(500)
+      .send({ message: `Error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Obtiene los datos del dashboard para el inquilino específico y rango de fechas.
+ * @async
+ * @function
+ * @param {Object} req - La solicitud HTTP.
+ * @param {Object} res - La respuesta HTTP.
+ * @returns {Promise&lt;void>} Respuesta al cliente con los datos del dashboard.
+ */
+exports.getDashboardData = async (req, res) => {
+  try {
+    const { tenantId, from, to, cashRegisterId } = req.query;
+
+    // Validación de parámetros de entrada
+    if (!tenantId || !from || !to || !cashRegisterId) {
+      return res.status(400).json({
+        message:
+          'Faltan parámetros requeridos: tenantId, from, to, o cashRegisterId.',
+        variant: 'warning',
+      });
+    }
+
+    // Obtener la caja actual del inquilino
+    const cashRegisterRef = db.collection(`cashRegister_${tenantId}`);
+    const cashRegisterDoc = cashRegisterRef.doc(cashRegisterId);
+    const cashRegisterSnapshot = await cashRegisterDoc.get();
+
+    if (!cashRegisterSnapshot.exists) {
+      return res.status(404).json({
+        message: 'No se encontró una caja abierta para este inquilino.',
+        variant: 'warning',
+      });
+    }
+
+    const dateFrom = moment(from).toISOString();
+    const dateTo = moment(to).toISOString();
+    const cashRegisterData = cashRegisterSnapshot.data();
+    const { currentBalance, initialBalance } = cashRegisterData;
+
+    const filteredOrders = cashRegisterData.orders.filter((order) => {
+      const orderDate = moment(order.bill.date).toISOString();
+      return orderDate >= dateFrom &amp;&amp; orderDate &lt;= dateTo;
+    });
+
+    // Si no hay órdenes en el rango de fechas
+    if (filteredOrders.length === 0) {
+      return res.status(200).json({
+        cash: currentBalance,
+        profits: currentBalance,
+        totalItems: 0,
+        totalMust: 0,
+        totalExpenses: 0,
+        expenses: [],
+        income: [],
+        receivable: [],
+        initialBalance,
+      });
+    }
+
+    // Calcular y devolver el informe
+    const response = await calReport(
+      filteredOrders,
+      currentBalance,
+      initialBalance
+    );
+    return res.status(200).json(response);
+  } catch (error) {
+    return res.status(500).send({
+      message: `Error 500 - ${error.message}`,
+      variant: 'error',
+    });
+  }
+};
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Namespaces</h3><ul><li><a href="CashRegisterRouter.html">CashRegisterRouter</a></li><li><a href="ClientRouter.html">ClientRouter</a></li><li><a href="ExpenseRouter.html">ExpenseRouter</a></li><li><a href="InvoiceRouter.html">InvoiceRouter</a></li><li><a href="ProductRouter.html">ProductRouter</a></li><li><a href="RegisterRouter.html">RegisterRouter</a></li></ul><h3>Global</h3><ul><li><a href="global.html#addTenant">addTenant</a></li><li><a href="global.html#calReport">calReport</a></li><li><a href="global.html#closeCashRegister">closeCashRegister</a></li><li><a href="global.html#createCategory">createCategory</a></li><li><a href="global.html#createClient">createClient</a></li><li><a href="global.html#createEmployees">createEmployees</a></li><li><a href="global.html#createExpense">createExpense</a></li><li><a href="global.html#createInvoice">createInvoice</a></li><li><a href="global.html#createProduct">createProduct</a></li><li><a href="global.html#createRegister">createRegister</a></li><li><a href="global.html#createReport">createReport</a></li><li><a href="global.html#createUser">createUser</a></li><li><a href="global.html#deleteCategory">deleteCategory</a></li><li><a href="global.html#deleteClient">deleteClient</a></li><li><a href="global.html#deleteEmployee">deleteEmployee</a></li><li><a href="global.html#deleteExpense">deleteExpense</a></li><li><a href="global.html#deleteProduct">deleteProduct</a></li><li><a href="global.html#deleteRegister">deleteRegister</a></li><li><a href="global.html#filterExpenses">filterExpenses</a></li><li><a href="global.html#filterRegisters">filterRegisters</a></li><li><a href="global.html#generateSKU">generateSKU</a></li><li><a href="global.html#getClients">getClients</a></li><li><a href="global.html#getDashboardData">getDashboardData</a></li><li><a href="global.html#getEmployees">getEmployees</a></li><li><a href="global.html#getExpenses">getExpenses</a></li><li><a href="global.html#getOrderToday">getOrderToday</a></li><li><a href="global.html#getProducts">getProducts</a></li><li><a href="global.html#getRegisters">getRegisters</a></li><li><a href="global.html#getTotals">getTotals</a></li><li><a href="global.html#infoNavbar">infoNavbar</a></li><li><a href="global.html#initialize">initialize</a></li><li><a href="global.html#initializeDefaultCategories">initializeDefaultCategories</a></li><li><a href="global.html#openCashRegister">openCashRegister</a></li><li><a href="global.html#updateClient">updateClient</a></li><li><a href="global.html#updateCurrentTenant">updateCurrentTenant</a></li><li><a href="global.html#updateEmployees">updateEmployees</a></li><li><a href="global.html#updateExpense">updateExpense</a></li><li><a href="global.html#updateProduct">updateProduct</a></li><li><a href="global.html#updateRegister">updateRegister</a></li><li><a href="global.html#updateTenant">updateTenant</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 4.0.2</a> on Fri Oct 25 2024 00:53:53 GMT-0500 (Colombia Standard Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

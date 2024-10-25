@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: controllers/tenantController.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: controllers/tenantController.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>const admin = require('firebase-admin');
+const { v4: uuidv4 } = require('uuid');
+const moment = require('moment');
+
+const db = admin.firestore();
+
+const {
+  defaultCategories,
+  infoNavbar,
+  businessUnits,
+} = require('../utils/global');
+/**
+ * Inicializa las categorías predeterminadas en la base de datos.
+ */
+async function initializeDefaultCategories(tenantId, typeKey) {
+  try {
+    const categoriesRef = db.collection(`categories_${tenantId}`);
+
+    const defaultCategoriesWithKeys = defaultCategories[typeKey].map(
+      (category) => ({
+        ...category,
+        key: uuidv4(),
+      })
+    );
+
+    const snapshot = await categoriesRef.get();
+    if (snapshot.empty) {
+      // Si está vacía, agregar las categorías predeterminadas
+      const batch = db.batch();
+      defaultCategoriesWithKeys.forEach((category) => {
+        const newDocRef = categoriesRef.doc(); // Crea un nuevo documento para cada categoría
+        batch.set(newDocRef, category);
+      });
+
+      // Ejecutar la inserción en lote
+      await batch.commit();
+    }
+  } catch (error) {
+    throw error.message;
+  }
+}
+
+/**
+ * Crea un nuevo usuario en la base de datos.
+ *
+ * @function
+ * @async
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ */
+exports.createUser = async (req, res) => {
+  try {
+    const { uid } = req.user;
+    const { data } = req.body;
+    const tenantId = uuidv4();
+    const initialBalance = 0;
+    const dataUser = {
+      tenants: [
+        {
+          ...data.tenant,
+          tenantId,
+          numBill: 0,
+          staff: 'Administrador',
+          rol: '99',
+          infoNavbar,
+          unit: businessUnits[data.tenant.type],
+        },
+      ],
+      user: data.user,
+      currentTenant: {
+        cashRegisterId: null,
+        tenantId,
+        rol: '99',
+      },
+    };
+
+    await db.collection('users').doc(uid).create(dataUser);
+
+    // Verificar si ya hay una caja abierta para este inquilino
+    const openCashRegisterRef = db.collection(`cashRegister_${tenantId}`);
+    const openCashRegisterSnapshot = await openCashRegisterRef.get();
+
+    // Verificar si todas las cajas tienen un estado en falta
+    const allRegistersInFault = openCashRegisterSnapshot.docs.every(
+      (doc) => doc.data().status === false
+    );
+
+    if (!allRegistersInFault) {
+      return res.status(400).json({
+        message: 'Ya hay una caja abierta para este tenant.',
+        variant: 'warning',
+      });
+    }
+
+    // Obtener el ID del nuevo documento antes de realizar set()
+    const openCashRegisterDoc = openCashRegisterRef.doc();
+    const openCashRegisterId = openCashRegisterDoc.id;
+
+    const dataCashRegister = {
+      cashRegisterId: openCashRegisterId,
+      tenantId,
+      initialBalance,
+      currentBalance: initialBalance,
+      openingDate: moment().toISOString(),
+      closingDate: null,
+      status: true,
+      orders: [],
+    };
+
+    // Utilizar el ID obtenido para establecer el documento
+    await openCashRegisterRef.doc(openCashRegisterId).set(dataCashRegister);
+
+    const userDoc = db.collection('users').doc(uid);
+    const userSnapshot = await userDoc.get();
+
+    const user = userSnapshot.data();
+
+    user.currentTenant.cashRegisterId = openCashRegisterId;
+    user.tenants[0].cashRegisterId = openCashRegisterId;
+
+    await userDoc.update(user);
+
+    await initializeDefaultCategories(tenantId, data.tenant.type);
+
+    return res
+      .status(200)
+      .json({ message: 'Usuario creado correctamente.', variant: 'success' });
+  } catch (error) {
+    return res
+      .status(500)
+      .send({ message: `error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Agrega un nuevo inquilino a la lista de inquilinos de un usuario.
+ *
+ * @function
+ * @async
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ */
+exports.addTenant = async (req, res) => {
+  try {
+    const { uid } = req.user;
+    const { data } = req.body;
+
+    const doc = db.collection('users').doc(uid);
+
+    const tenant = {
+      ...data,
+      tenantId: uuidv4(),
+      numBill: 0,
+      staff: 'Administrador',
+      rol: '99',
+      infoNavbar,
+    };
+
+    await doc.update({
+      tenants: admin.firestore.FieldValue.arrayUnion(tenant),
+    });
+
+    return res
+      .status(200)
+      .json({ message: 'Tenant agregado correctamente.', variant: 'success' });
+  } catch (error) {
+    return res
+      .status(500)
+      .send({ message: `error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Actualiza la información de un inquilino específico para un usuario.
+ *
+ * @function
+ * @async
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ */
+exports.updateTenant = async (req, res) => {
+  try {
+    const { data, tenant } = req.body;
+    const { uid } = req.user;
+
+    const documentoRef = db.collection('users').doc(uid);
+
+    const docSnapshot = await documentoRef.get();
+
+    if (docSnapshot.exists) {
+      const dataSnapshot = docSnapshot.data();
+      const tenants = dataSnapshot.tenants || [];
+
+      // Encontrar el índice del tenant que deseas actualizar en el array
+      const indexToUpdate = tenants.findIndex(
+        (items) => items.tenantId === tenant.tenantId
+      );
+
+      if (indexToUpdate !== -1) {
+        // Actualizar el tenant en el array
+        tenants[indexToUpdate] = {
+          ...tenants[indexToUpdate],
+          ...data,
+        };
+
+        // Actualizar el documento con el array modificado
+        await documentoRef.update({ tenants });
+        res.status(200).json({
+          message: 'Tenant actualizado correctamente.',
+          variant: 'success',
+        });
+      } else {
+        res.status(400).json({
+          message: 'El tenant con el ID especificado no fue encontrado.',
+          variant: 'success',
+        });
+      }
+    } else {
+      res
+        .status(400)
+        .json({ message: 'El documento no existe.', variant: 'warning' });
+    }
+  } catch (error) {
+    res
+      .status(500)
+      .json({ message: `error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Obtiene la información del cliente (usuario) actual.
+ *
+ * @function
+ * @async
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ */
+exports.initialize = async (req, res) => {
+  try {
+    const { uid } = req.user;
+
+    const doc = db.collection('users').doc(uid);
+    const client = await doc.get();
+    const response = client.data();
+
+    return res.status(200).json(response);
+  } catch (error) {
+    return res
+      .status(500)
+      .send({ message: `error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+
+/**
+ * Actualiza la información del cliente (usuario) actual.
+ *
+ * @function
+ * @async
+ * @param {Object} req - Objeto de solicitud Express.
+ * @param {Object} res - Objeto de respuesta Express.
+ * @returns {Promise&lt;void>} Promesa que indica la finalización de la operación.
+ */
+exports.updateCurrentTenant = async (req, res) => {
+  try {
+    const { uid } = req.user;
+    const { tenantId, cashRegisterId } = req.body.tenant;
+
+    const userDoc = db.collection('users').doc(uid);
+    const userSnapshot = await userDoc.get();
+
+    const user = userSnapshot.data();
+
+    const tenant = user.tenants.find((tenent) => tenent.tenantId === tenantId);
+
+    user.currentTenant.tenantId = tenantId;
+    user.currentTenant.cashRegisterId = cashRegisterId;
+    user.currentTenant.rol = tenant.rol;
+
+    await userDoc.update(user);
+
+    return res
+      .status(200)
+      .json({ message: 'Cambio de tenant', variant: 'success' });
+  } catch (error) {
+    return res
+      .status(500)
+      .send({ message: `error 500 - ${error.message}`, variant: 'error' });
+  }
+};
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Namespaces</h3><ul><li><a href="CashRegisterRouter.html">CashRegisterRouter</a></li><li><a href="ClientRouter.html">ClientRouter</a></li><li><a href="ExpenseRouter.html">ExpenseRouter</a></li><li><a href="InvoiceRouter.html">InvoiceRouter</a></li><li><a href="ProductRouter.html">ProductRouter</a></li><li><a href="RegisterRouter.html">RegisterRouter</a></li></ul><h3>Global</h3><ul><li><a href="global.html#addTenant">addTenant</a></li><li><a href="global.html#calReport">calReport</a></li><li><a href="global.html#closeCashRegister">closeCashRegister</a></li><li><a href="global.html#createCategory">createCategory</a></li><li><a href="global.html#createClient">createClient</a></li><li><a href="global.html#createEmployees">createEmployees</a></li><li><a href="global.html#createExpense">createExpense</a></li><li><a href="global.html#createInvoice">createInvoice</a></li><li><a href="global.html#createProduct">createProduct</a></li><li><a href="global.html#createRegister">createRegister</a></li><li><a href="global.html#createReport">createReport</a></li><li><a href="global.html#createUser">createUser</a></li><li><a href="global.html#deleteCategory">deleteCategory</a></li><li><a href="global.html#deleteClient">deleteClient</a></li><li><a href="global.html#deleteEmployee">deleteEmployee</a></li><li><a href="global.html#deleteExpense">deleteExpense</a></li><li><a href="global.html#deleteProduct">deleteProduct</a></li><li><a href="global.html#deleteRegister">deleteRegister</a></li><li><a href="global.html#filterExpenses">filterExpenses</a></li><li><a href="global.html#filterRegisters">filterRegisters</a></li><li><a href="global.html#generateSKU">generateSKU</a></li><li><a href="global.html#getClients">getClients</a></li><li><a href="global.html#getDashboardData">getDashboardData</a></li><li><a href="global.html#getEmployees">getEmployees</a></li><li><a href="global.html#getExpenses">getExpenses</a></li><li><a href="global.html#getOrderToday">getOrderToday</a></li><li><a href="global.html#getProducts">getProducts</a></li><li><a href="global.html#getRegisters">getRegisters</a></li><li><a href="global.html#getTotals">getTotals</a></li><li><a href="global.html#infoNavbar">infoNavbar</a></li><li><a href="global.html#initialize">initialize</a></li><li><a href="global.html#initializeDefaultCategories">initializeDefaultCategories</a></li><li><a href="global.html#openCashRegister">openCashRegister</a></li><li><a href="global.html#updateClient">updateClient</a></li><li><a href="global.html#updateCurrentTenant">updateCurrentTenant</a></li><li><a href="global.html#updateEmployees">updateEmployees</a></li><li><a href="global.html#updateExpense">updateExpense</a></li><li><a href="global.html#updateProduct">updateProduct</a></li><li><a href="global.html#updateRegister">updateRegister</a></li><li><a href="global.html#updateTenant">updateTenant</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 4.0.2</a> on Fri Oct 25 2024 00:53:53 GMT-0500 (Colombia Standard Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>
